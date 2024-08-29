@@ -1,0 +1,20 @@
+<dependencies>
+
+  <!-- Android maven dependencies -->
+  <androidPackages>
+    <repositories>
+      <repository>https://repo.maven.apache.org/maven2</repository>
+    </repositories>
+    <androidPackage spec="com.taptap.sdk:tap-login-unity:4.3.10"/>
+  </androidPackages>
+
+  <!-- iOS Cocoapod dependencies can be specified by each iosPod element. -->
+  <iosPods>
+    <sources>
+      <source>https://github.com/CocoaPods/Specs.git</source>
+    </sources>
+    <iosPod name="Kingfisher" version="~> 6.0" bitcodeEnabled="false" addToAllTargets="false"/>
+    <iosPod name="TapTapLoginSDK" version="~> 4.3.10" bitcodeEnabled="false" addToAllTargets="false"/>
+  </iosPods>
+</dependencies>
+
