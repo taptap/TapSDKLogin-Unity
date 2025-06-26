@@ -80,121 +80,152 @@ namespace TapSDK.Login.Internal
                 scopes = scopes.Append(complianceScope).ToArray();
             }
             
+#if UNITY_STANDALONE_WIN
             // 是否使用 Tap 启动器登录
-            bool isNeedLoginByClient = TapCoreStandalone.IsNeedLoginByTapClient();
-
+            bool isNeedLoginByClient = TapClientStandalone.IsNeedLoginByTapClient();
             if (isNeedLoginByClient)
             {
-                TapLoginTracker.Instance.TrackStart("loginWithScopes", sessionId, TapLoginTracker.LOGIN_TYPE_CLIENT);
-                string info = "{\"device_id\":\"" + SystemInfo.deviceModel + "\"}";
-                string sdkUA = "client_id=" + TapTapSdk.ClientId + "&uuid=" + SystemInfo.deviceUniqueIdentifier;
-                TapLogger.Debug("LoginWithScopes start in mainthread = " + Thread.CurrentThread.ManagedThreadId);
-                return Task.Run(async () =>
+                async Task<TapTapAccount> innerLogin()
                 {
-                    string responseType = "code";
-                    string redirectUri = "tapoauth://authorize";
-                    string state = Guid.NewGuid().ToString("N");
-                    string codeVerifier = CodeUtil.GenerateCodeVerifier();
-                    string codeChallenge = CodeUtil.GetCodeChallenge(codeVerifier);
-                    string versionCode = TapTapSDK.Version;
-                    string codeChallengeMethod = "S256";
-                    TapCoreStandalone.TapLoginResponseByTapClient response = await TapCoreStandalone.LoginWithScopesAsync(scopes,
-                    responseType, redirectUri, codeChallenge, state, codeChallengeMethod, versionCode, sdkUA, info);
-                    TapLogger.Debug("start handle login result");
-                    TapLogger.Debug("LoginWithScopes handle in mainthread = " + Thread.CurrentThread.ManagedThreadId);
-
-                    if (response.isCancel)
+                    try
+                    {
+                        TapLoginTracker.Instance.TrackStart("loginWithScopes", sessionId, TapLoginTracker.LOGIN_TYPE_CLIENT);
+                        TapTapAccount account = await AuthorizeInternalWithTapClient<TapTapAccount>(scopes, true);
+                        IsLogging = false;
+                        TapLoginTracker.Instance.TrackSuccess("loginWithScopes", sessionId, TapLoginTracker.LOGIN_TYPE_CLIENT);
+                        return account;
+                    }
+                    catch (TaskCanceledException e)
                     {
                         IsLogging = false;
                         TapLoginTracker.Instance.TrackCancel("loginWithScopes", sessionId, TapLoginTracker.LOGIN_TYPE_CLIENT);
-                        throw new TaskCanceledException();
+                        throw e;
                     }
-                    else if (response.isFail || string.IsNullOrEmpty(response.redirectUri))
+                    catch (Exception e)
                     {
                         IsLogging = false;
-                        TapLoginTracker.Instance.TrackFailure("loginWithScopes", sessionId, TapLoginTracker.LOGIN_TYPE_CLIENT, (int)TapErrorCode.ERROR_CODE_UNDEFINED, response.errorMsg ?? "未知错误");
-                        throw new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, response.errorMsg ?? "未知错误");
+                        TapLoginTracker.Instance.TrackFailure("loginWithScopes", sessionId, TapLoginTracker.LOGIN_TYPE_CLIENT, (int)TapErrorCode.ERROR_CODE_UNDEFINED, e.Message ?? "未知错误");
+                        throw e;
+                    }
+                }
+                return innerLogin();
+            }
+#endif
+            /// 非启动器，走扫码或网页流程
+            TapLoginTracker.Instance.TrackStart("loginWithScopes", sessionId);
+            TaskCompletionSource<TapTapAccount> tcs = new TaskCompletionSource<TapTapAccount>();
+            LoginPanelController.OpenParams openParams = new LoginPanelController.OpenParams
+            {
+                ClientId = TapTapSdk.ClientId,
+                Scopes = scopes,
+                OnAuth = async (tokenData, loginType) =>
+                {
+                    if (tokenData == null)
+                    {
+                        TapLoginTracker.Instance.TrackFailure("loginWithScopes", sessionId, loginType, (int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error");
+                        IsLogging = false;
+                        tcs.TrySetException(new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error"));
                     }
                     else
                     {
-                        TapLogger.Debug("login success prepare get token");
+                        // 将 TokenData 转化为 AccessToken
+                        AccessToken refreshToken = new AccessToken
+                        {
+                            kid = tokenData.Kid,
+                            tokenType = tokenData.TokenType,
+                            macKey = tokenData.MacKey,
+                            macAlgorithm = tokenData.MacAlgorithm,
+                            scopeSet = tokenData.Scopes
+                        };
                         try
                         {
-                            Uri uri = new Uri(response.redirectUri);
-                            NameValueCollection queryPairs = UrlUtils.ParseQueryString(uri.Query);
-                            string code = queryPairs["code"];
-                            string uriState = queryPairs["state"];
-                            string error = queryPairs["error"];
-                            if (string.IsNullOrEmpty(error) && uriState == state && !string.IsNullOrEmpty(code))
+                            ProfileData profileData = await LoginService.GetProfile(TapTapSdk.ClientId, refreshToken);
+                            if (profileData != null)
                             {
-                                TokenData tokenData = await LoginService.Authorize(TapTapSdk.ClientId, code, codeVerifier);
-                                if (tokenData == null)
-                                {
-                                    throw new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error");
-                                }else {
-                                    // 将 TokenData 转化为 AccessToken
-                                    AccessToken refreshToken = new AccessToken
-                                    {
-                                        kid = tokenData.Kid,
-                                        tokenType = tokenData.TokenType,
-                                        macKey = tokenData.MacKey,
-                                        macAlgorithm = tokenData.MacAlgorithm,
-                                        scopeSet = tokenData.Scopes
-                                    };
-                                    try
-                                    {
-                                        ProfileData profileData = await LoginService.GetProfile(TapTapSdk.ClientId, refreshToken);
-                                        if (profileData != null)
-                                        {
-                                            AccountManager.Instance.Account = new TapTapAccount(
-                                                refreshToken, profileData.OpenId, profileData.UnionId, profileData.Name, profileData.Avatar,
-                                                profileData.Email);
-                                            IsLogging = false;
-                                            TapLoginTracker.Instance.TrackSuccess("loginWithScopes", sessionId, TapLoginTracker.LOGIN_TYPE_CLIENT);
-                                            return AccountManager.Instance.Account;
-                                        }
-                                        else
-                                        {
-                                            throw new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error");
-                                        }
-                                    }
-                                    catch (Exception e)
-                                    {
-                                        throw new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error " + e.Message);
-                                    }
-                                }
+                                TapLoginTracker.Instance.TrackSuccess("loginWithScopes", sessionId, loginType);
+                                AccountManager.Instance.Account = new TapTapAccount(
+                                    refreshToken, profileData.OpenId, profileData.UnionId, profileData.Name, profileData.Avatar,
+                                    profileData.Email);
+                                IsLogging = false;
+                                tcs.TrySetResult(AccountManager.Instance.Account);
                             }
                             else
                             {
-                                TapLogger.Debug("login success prepare get token but get  error " + error);
-                                throw new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, error ?? "数据解析异常");
+                                TapLoginTracker.Instance.TrackFailure("loginWithScopes", sessionId, loginType, (int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error");
+                                IsLogging = false;
+                                tcs.TrySetException(new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error"));
                             }
                         }
-                        catch (Exception ex)
-                        {
-                            IsLogging = false;
-                            TapLogger.Debug("login success prepare get token  fail " + ex.StackTrace);
-                            TapLoginTracker.Instance.TrackFailure("loginWithScopes", sessionId, TapLoginTracker.LOGIN_TYPE_CLIENT, (int)TapErrorCode.ERROR_CODE_UNDEFINED, ex.Message ?? "UnKnow Error");
-                            throw new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, ex.StackTrace);
-                        }
-                    }
-                });
-            }
-            else
-            {
-                TapLoginTracker.Instance.TrackStart("loginWithScopes", sessionId);
-                TaskCompletionSource<TapTapAccount> tcs = new TaskCompletionSource<TapTapAccount>();
-                LoginPanelController.OpenParams openParams = new LoginPanelController.OpenParams
-                {
-                    ClientId = TapTapSdk.ClientId,
-                    Scopes = scopes,
-                    OnAuth = async (tokenData, loginType) =>
-                    {
-                        if (tokenData == null)
+                        catch (Exception e)
                         {
                             TapLoginTracker.Instance.TrackFailure("loginWithScopes", sessionId, loginType, (int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error");
                             IsLogging = false;
-                            tcs.TrySetException(new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error"));
+                            tcs.TrySetException(new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error " + e.Message));
+                        }
+                    }
+                },
+                OnError = (e, loginType) =>
+                {
+                    TapLoginTracker.Instance.TrackFailure("loginWithScopes", sessionId, loginType, e.Code, e.Message);
+                    IsLogging = false;
+                    tcs.TrySetException(e);
+                },
+                OnClose = () =>
+                {
+                    TapLoginTracker.Instance.TrackCancel("loginWithScopes", sessionId);
+                    IsLogging = false;
+                    tcs.TrySetCanceled();
+                }
+            };
+            TapSDK.UI.UIManager.Instance.OpenUI<LoginPanelController>("Prefabs/TapLogin/LoginPanel", openParams);
+            return tcs.Task;
+            
+        }
+        
+#if UNITY_STANDALONE_WIN
+        private async Task<T> AuthorizeInternalWithTapClient<T>(string[] scopes = null, bool needProfile = true)
+        {
+            string info = "{\"device_id\":\"" + SystemInfo.deviceModel + "\"}";
+            string sdkUA = "client_id=" + TapTapSdk.ClientId + "&uuid=" + SystemInfo.deviceUniqueIdentifier;
+            TapLogger.Debug("LoginWithScopes start in thread = " + Thread.CurrentThread.ManagedThreadId);
+            TaskCompletionSource<T> taskCompletionSource = new TaskCompletionSource<T>();
+
+            string responseType = "code";
+            string redirectUri = "tapoauth://authorize";
+            string state = Guid.NewGuid().ToString("N");
+            string codeVerifier = CodeUtil.GenerateCodeVerifier();
+            string codeChallenge = CodeUtil.GetCodeChallenge(codeVerifier);
+            string versionCode = TapTapSDK.Version;
+            string codeChallengeMethod = "S256";
+            TapLoginClientBridge.TapLoginResponseByTapClient response = await TapLoginClientBridge.LoginWithScopesAsync(scopes,
+            responseType, redirectUri, codeChallenge, state, codeChallengeMethod, versionCode, sdkUA, info);
+            TapLogger.Debug("start handle login result");
+            TapLogger.Debug("LoginWithScopes handle in thread = " + Thread.CurrentThread.ManagedThreadId);
+
+            if (response.isCancel)
+            {
+                taskCompletionSource.TrySetException(new TaskCanceledException());
+            }
+            else if (response.isFail || string.IsNullOrEmpty(response.redirectUri))
+            {
+                taskCompletionSource.TrySetException(new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, response.errorMsg ?? "未知错误"));
+            }
+            else
+            {
+                TapLogger.Debug("login success prepare get token");
+                try
+                {
+                    Uri uri = new Uri(response.redirectUri);
+                    NameValueCollection queryPairs = UrlUtils.ParseQueryString(uri.Query);
+                    string code = queryPairs["code"];
+                    string uriState = queryPairs["state"];
+                    string error = queryPairs["error"];
+                    if (string.IsNullOrEmpty(error) && uriState == state && !string.IsNullOrEmpty(code))
+                    {
+                        TokenData tokenData = await LoginService.Authorize(TapTapSdk.ClientId, code, codeVerifier);
+                        if (tokenData == null)
+                        {
+                            throw new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, "get token data failed");
                         }
                         else
                         {
@@ -207,166 +238,99 @@ namespace TapSDK.Login.Internal
                                 macAlgorithm = tokenData.MacAlgorithm,
                                 scopeSet = tokenData.Scopes
                             };
-                            try
+                            if (!needProfile)
+                            {
+                                taskCompletionSource.TrySetResult((T)(object)refreshToken);
+                            }
+                            else
                             {
                                 ProfileData profileData = await LoginService.GetProfile(TapTapSdk.ClientId, refreshToken);
                                 if (profileData != null)
                                 {
-                                    TapLoginTracker.Instance.TrackSuccess("loginWithScopes", sessionId, loginType);
                                     AccountManager.Instance.Account = new TapTapAccount(
                                         refreshToken, profileData.OpenId, profileData.UnionId, profileData.Name, profileData.Avatar,
                                         profileData.Email);
-                                    IsLogging = false;
-                                    tcs.TrySetResult(AccountManager.Instance.Account);
+                                    taskCompletionSource.TrySetResult((T)(object)AccountManager.Instance.Account);
                                 }
                                 else
                                 {
-                                    TapLoginTracker.Instance.TrackFailure("loginWithScopes", sessionId, loginType, (int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error");
-                                    IsLogging = false;
-                                    tcs.TrySetException(new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error"));
+                                    throw new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, "fetch profile data failed");
                                 }
                             }
-                            catch (Exception e)
-                            {
-                                TapLoginTracker.Instance.TrackFailure("loginWithScopes", sessionId, loginType, (int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error");
-                                IsLogging = false;
-                                tcs.TrySetException(new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error " + e.Message));
-                            }
                         }
-                    },
-                    OnError = (e, loginType) =>
-                    {
-                        TapLoginTracker.Instance.TrackFailure("loginWithScopes", sessionId, loginType, e.Code, e.Message);
-                        IsLogging = false;
-                        tcs.TrySetException(e);
-                    },
-                    OnClose = () =>
-                    {
-                        TapLoginTracker.Instance.TrackCancel("loginWithScopes", sessionId);
-                        IsLogging = false;
-                        tcs.TrySetCanceled();
-                    }
-                };
-                TapSDK.UI.UIManager.Instance.OpenUI<LoginPanelController>("Prefabs/TapLogin/LoginPanel", openParams);
-                return tcs.Task;
-            }
-        }
-
-        public Task<AccessToken> Authorize(string[] scopes = null)
-        {
-             // 是否使用 Tap 启动器登录
-            bool isNeedLoginByClient = TapCoreStandalone.IsNeedLoginByTapClient();
-
-            if (isNeedLoginByClient)
-            {
-                string info = "{\"device_id\":\"" + SystemInfo.deviceModel + "\"}";
-                string sdkUA = "client_id=" + TapTapSdk.ClientId + "&uuid=" + SystemInfo.deviceUniqueIdentifier;
-                TapLogger.Debug("LoginWithScopes start in mainthread = " + Thread.CurrentThread.ManagedThreadId);
-                return Task.Run(async () =>
-                {
-                    string responseType = "code";
-                    string redirectUri = "tapoauth://authorize";
-                    string state = Guid.NewGuid().ToString("N");
-                    string codeVerifier = CodeUtil.GenerateCodeVerifier();
-                    string codeChallenge = CodeUtil.GetCodeChallenge(codeVerifier);
-                    string versionCode = TapTapSDK.Version;
-                    string codeChallengeMethod = "S256";
-                    TapCoreStandalone.TapLoginResponseByTapClient response = await TapCoreStandalone.LoginWithScopesAsync(scopes,
-                    responseType, redirectUri, codeChallenge, state, codeChallengeMethod, versionCode, sdkUA, info);
-                    TapLogger.Debug("start handle login result");
-                    TapLogger.Debug("LoginWithScopes handle in mainthread = " + Thread.CurrentThread.ManagedThreadId);
-
-                    if (response.isCancel)
-                    {
-                         throw new TaskCanceledException();
-                    }
-                    else if (response.isFail || string.IsNullOrEmpty(response.redirectUri))
-                    {
-                        throw new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, response.errorMsg ?? "未知错误");
                     }
                     else
                     {
-                        TapLogger.Debug("login success prepare get token");
-                        try
-                        {
-                            Uri uri = new Uri(response.redirectUri);
-                            NameValueCollection queryPairs = UrlUtils.ParseQueryString(uri.Query);
-                            string code = queryPairs["code"];
-                            string uriState = queryPairs["state"];
-                            string error = queryPairs["error"];
-                            if (string.IsNullOrEmpty(error) && uriState == state && !string.IsNullOrEmpty(code))
-                            {
-                                TokenData tokenData = await LoginService.Authorize(TapTapSdk.ClientId, code, codeVerifier);
-                                if (tokenData == null)
-                                {
-                                    throw new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error");
-                                }else {
-                                // 将 TokenData 转化为 AccessToken
-                                    AccessToken refreshToken = new AccessToken
-                                    {
-                                        kid = tokenData.Kid,
-                                        tokenType = tokenData.TokenType,
-                                        macKey = tokenData.MacKey,
-                                        macAlgorithm = tokenData.MacAlgorithm,
-                                        scopeSet = tokenData.Scopes
-                                    };
-                                    return refreshToken;
-                                }
-                            }
-                            else
-                            {
-                                TapLogger.Debug("login success prepare get token but get  error " + error);
-                                throw new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, error ?? "数据解析异常");
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            TapLogger.Debug("login success prepare get token  fail " + ex.StackTrace);
-                            throw new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, ex.StackTrace);
-                        }
+                        TapLogger.Debug("login success prepare get token but get  error " + error);
+                        throw new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, error ?? "数据解析异常");
                     }
-                });
-            }
-            else
-            {
-                TaskCompletionSource<AccessToken> tcs = new TaskCompletionSource<AccessToken>();
-                LoginPanelController.OpenParams openParams = new LoginPanelController.OpenParams
+                }
+                catch (Exception ex)
                 {
-                    ClientId = TapTapSdk.ClientId,
-                    Scopes = new HashSet<string>(scopes).ToArray(),
-                    OnAuth = (tokenData, loginType) =>
-                    {
-                        if (tokenData == null)
-                        {
-                            tcs.TrySetException(new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error"));
-                        }
-                        else
-                        {
-                            // 将 TokenData 转化为 AccessToken
-                            AccessToken accessToken = new AccessToken
-                            {
-                                kid = tokenData.Kid,
-                                tokenType = tokenData.TokenType,
-                                macKey = tokenData.MacKey,
-                                macAlgorithm = tokenData.MacAlgorithm,
-                                scopeSet = tokenData.Scopes
-                            };
-                            tcs.TrySetResult(accessToken);
-                        }
-                    },
-                    OnError = (e, loginType) =>
-                    {
-                        tcs.TrySetException(e);
-                    },
-                    OnClose = () =>
-                    {
-                        tcs.TrySetException(
-                            new TapException((int)TapErrorCode.ERROR_CODE_LOGIN_CANCEL, "Login Cancel"));
-                    }
-                };
-                TapSDK.UI.UIManager.Instance.OpenUI<LoginPanelController>("Prefabs/TapLogin/LoginPanel", openParams);
-                return tcs.Task;
+                    TapLogger.Debug("login success prepare get token  fail " + ex.Message);
+                    taskCompletionSource.TrySetException(ex);
+                }
             }
+            return await taskCompletionSource.Task;
+        }
+#endif
+
+        public Task<AccessToken> Authorize(string[] scopes = null)
+        {
+
+#if UNITY_STANDALONE_WIN
+            // 是否使用 Tap 启动器登录
+            bool isNeedLoginByClient = TapClientStandalone.IsNeedLoginByTapClient();
+
+            if (isNeedLoginByClient)
+            {
+                async Task<AccessToken> innerLogin()
+                {
+                    AccessToken token = await AuthorizeInternalWithTapClient<AccessToken>(scopes, false);
+                    return token;
+                }
+                return innerLogin();
+            }
+#endif
+
+            TaskCompletionSource<AccessToken> tcs = new TaskCompletionSource<AccessToken>();
+            LoginPanelController.OpenParams openParams = new LoginPanelController.OpenParams
+            {
+                ClientId = TapTapSdk.ClientId,
+                Scopes = new HashSet<string>(scopes).ToArray(),
+                OnAuth = (tokenData, loginType) =>
+                {
+                    if (tokenData == null)
+                    {
+                        tcs.TrySetException(new TapException((int)TapErrorCode.ERROR_CODE_UNDEFINED, "UnKnow Error"));
+                    }
+                    else
+                    {
+                        // 将 TokenData 转化为 AccessToken
+                        AccessToken accessToken = new AccessToken
+                        {
+                            kid = tokenData.Kid,
+                            tokenType = tokenData.TokenType,
+                            macKey = tokenData.MacKey,
+                            macAlgorithm = tokenData.MacAlgorithm,
+                            scopeSet = tokenData.Scopes
+                        };
+                        tcs.TrySetResult(accessToken);
+                    }
+                },
+                OnError = (e, loginType) =>
+                {
+                    tcs.TrySetException(e);
+                },
+                OnClose = () =>
+                {
+                    tcs.TrySetException(
+                        new TapException((int)TapErrorCode.ERROR_CODE_LOGIN_CANCEL, "Login Cancel"));
+                }
+            };
+            TapSDK.UI.UIManager.Instance.OpenUI<LoginPanelController>("Prefabs/TapLogin/LoginPanel", openParams);
+            return tcs.Task;
+            
         }
 
         public void Logout()
